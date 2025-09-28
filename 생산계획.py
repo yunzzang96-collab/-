@@ -530,6 +530,54 @@ class SmartScheduler:
 
         switches = 0
 
+        def choose_continuous_grade(
+            current_grade: Optional[str],
+            candidates: List[Tuple[str, float]],
+        ) -> Tuple[Optional[str], Dict[str, float]]:
+            """선택 가능한 등급 중 현재 등급을 우선 유지한다."""
+
+            valid_caps = {
+                pid: cap for pid, cap in candidates if cap is not None and cap > 0
+            }
+            if not valid_caps:
+                return None, {}
+
+            if (
+                current_grade
+                and current_grade in valid_caps
+                and product_status[current_grade]["left"] > 0
+            ):
+                return current_grade, valid_caps
+
+            best_pid = max(valid_caps, key=lambda pid: product_status[pid]["left"])
+            return best_pid, valid_caps
+
+        def choose_raw_grade(
+            current_grade: Optional[str],
+            lv_need: float,
+            llv_need: float,
+            np3_needed: bool,
+        ) -> Optional[str]:
+            need_lv = lv_need > 0 or np3_needed
+            need_llv = llv_need > 0
+
+            if current_grade == "LV" and need_lv:
+                return "LV"
+            if current_grade == "LLV" and need_llv:
+                return "LLV"
+
+            if need_lv and not need_llv:
+                return "LV"
+            if need_llv and not need_lv:
+                return "LLV"
+
+            if need_lv and need_llv:
+                if llv_need > lv_need:
+                    return "LLV"
+                return "LV"
+
+            return None
+
         def schedule_product(pid: str, capacity_limit: float) -> float:
             if pid == "HV_PACK":
                 return 0.0
@@ -577,6 +625,10 @@ class SmartScheduler:
 
             return produced
 
+        current_s2_grade: Optional[str] = None
+        current_s3_granule_grade: Optional[str] = None
+        current_s3_raw_grade: Optional[str] = None
+
         for day in range(DAYS):
             current_date = start_date + timedelta(days=day)
             date_str = current_date.strftime("%Y-%m-%d")
@@ -596,17 +648,38 @@ class SmartScheduler:
             c_line_capacity = self._get_entry_value("c_line_capa", PACK_S3)
 
             planned_remaining_s1s2 = remaining_s1s2_capacity
-            planned_h_capacity = planned_remaining_s1s2
+            h_capacity_candidate = planned_remaining_s1s2
             if h_daily_limit > 0:
-                planned_h_capacity = min(planned_h_capacity, h_daily_limit)
-            planned_h = min(product_status["H_PELLET"]["left"], planned_h_capacity)
-            planned_remaining_s1s2 = max(0.0, planned_remaining_s1s2 - planned_h)
+                h_capacity_candidate = min(h_capacity_candidate, h_daily_limit)
+            h_capacity_candidate = min(
+                h_capacity_candidate, product_status["H_PELLET"]["left"]
+            )
 
-            planned_g_capacity = planned_remaining_s1s2
+            g_capacity_candidate = planned_remaining_s1s2
             if g_daily_limit > 0:
-                planned_g_capacity = min(planned_g_capacity, g_daily_limit)
-            planned_g = min(product_status["G_PELLET"]["left"], planned_g_capacity)
-            planned_remaining_s1s2 = max(0.0, planned_remaining_s1s2 - planned_g)
+                g_capacity_candidate = min(g_capacity_candidate, g_daily_limit)
+            g_capacity_candidate = min(
+                g_capacity_candidate, product_status["G_PELLET"]["left"]
+            )
+
+            selected_s2_grade, s2_valid_caps = choose_continuous_grade(
+                current_s2_grade,
+                [
+                    ("H_PELLET", h_capacity_candidate),
+                    ("G_PELLET", g_capacity_candidate),
+                ],
+            )
+
+            planned_h = 0.0
+            planned_g = 0.0
+            if selected_s2_grade == "H_PELLET":
+                planned_h = s2_valid_caps.get("H_PELLET", 0.0)
+            elif selected_s2_grade == "G_PELLET":
+                planned_g = s2_valid_caps.get("G_PELLET", 0.0)
+
+            planned_remaining_s1s2 = max(
+                0.0, planned_remaining_s1s2 - planned_h - planned_g
+            )
 
             planned_hv = max(0.0, min(planned_remaining_s1s2, s1_hv_max))
 
@@ -617,10 +690,23 @@ class SmartScheduler:
 
             planned_c = min(product_status["C_PELLET"]["left"], c_line_capacity)
 
-            planned_granule_remaining = granule_capacity
-            planned_lv = min(product_status["LV_PACK"]["left"], planned_granule_remaining)
-            planned_granule_remaining = max(0.0, planned_granule_remaining - planned_lv)
-            planned_llv = min(product_status["LLV_PACK"]["left"], planned_granule_remaining)
+            lv_candidate = min(granule_capacity, product_status["LV_PACK"]["left"])
+            llv_candidate = min(granule_capacity, product_status["LLV_PACK"]["left"])
+
+            selected_s3_granule_grade, granule_valid_caps = choose_continuous_grade(
+                current_s3_granule_grade,
+                [
+                    ("LV_PACK", lv_candidate),
+                    ("LLV_PACK", llv_candidate),
+                ],
+            )
+
+            planned_lv = 0.0
+            planned_llv = 0.0
+            if selected_s3_granule_grade == "LV_PACK":
+                planned_lv = granule_valid_caps.get("LV_PACK", 0.0)
+            elif selected_s3_granule_grade == "LLV_PACK":
+                planned_llv = granule_valid_caps.get("LLV_PACK", 0.0)
 
             required_s1_hv = 0.5 * planned_h + planned_g + planned_hv
             required_s2_lv = 0.5 * planned_h
@@ -660,34 +746,17 @@ class SmartScheduler:
             )
             current_s3_lv = stocks["S3"]["LV"]
             lv_needed_for_stock = max(0.0, target_s3_lv_base - current_s3_lv)
-            lv_for_stock = min(
-                lv_needed_for_stock,
-                s3_lv_capacity,
-                max(0.0, INVENTORY_CAP - current_s3_lv),
-            )
-            if lv_for_stock > 0:
-                stocks["S3"]["LV"] += lv_for_stock
-                raw_production_today["S3 LV생산"] += lv_for_stock
-
-            remaining_lv_capacity = max(0.0, s3_lv_capacity - raw_production_today["S3 LV생산"])
-            remaining_lv_inventory_room = max(0.0, INVENTORY_CAP - stocks["S3"]["LV"])
 
             s3_llv_capacity = self._get_entry_value("l2_cap", PACK_S3)
-            llv_buffer = LLV_SAFETY_STOCK_FOR_C if product_status["C_PELLET"]["left"] > 0 else 0.0
+            llv_buffer = (
+                LLV_SAFETY_STOCK_FOR_C if product_status["C_PELLET"]["left"] > 0 else 0.0
+            )
             target_s3_llv = min(
                 INVENTORY_CAP,
                 required_s3_llv + planned_llv * RESERVATION_BUFFER_DAYS + llv_buffer,
             )
             current_s3_llv = stocks["S3"]["LLV"]
-            if current_s3_llv < target_s3_llv:
-                produce_s3_llv = min(
-                    target_s3_llv - current_s3_llv,
-                    max(0.0, s3_llv_capacity),
-                    INVENTORY_CAP - current_s3_llv,
-                )
-                if produce_s3_llv > 0:
-                    stocks["S3"]["LLV"] += produce_s3_llv
-                    raw_production_today["LLV 생산"] = produce_s3_llv
+            llv_deficit = max(0.0, target_s3_llv - current_s3_llv)
 
             np3_capacity = max(0.0, NP3_TARGET_BATCH_PRODUCTION_SIZE)
             np3_target_level = required_np3 + planned_f * RESERVATION_BUFFER_DAYS
@@ -700,25 +769,85 @@ class SmartScheduler:
             np3_capacity = min(np3_capacity, max(0.0, NP3_MAX_INV - current_np3))
             potential_np3 = min(np3_deficit, np3_capacity)
             np3_produced = 0.0
-            if (
-                potential_np3 > 0
-                and NP3_PRODUCTION_RATE_IN_CAMPAIGN > 0
-                and remaining_lv_capacity > 0
-                and remaining_lv_inventory_room > 0
-            ):
-                lv_capacity_for_np3 = min(remaining_lv_capacity, remaining_lv_inventory_room)
-                max_np3_based_on_lv = lv_capacity_for_np3 * NP3_PRODUCTION_RATE_IN_CAMPAIGN
-                np3_produced = min(potential_np3, max_np3_based_on_lv)
-                if np3_produced > 0:
-                    lv_for_np3 = np3_produced / NP3_PRODUCTION_RATE_IN_CAMPAIGN
-                    stocks["S3"]["LV"] += lv_for_np3
-                    raw_production_today["S3 LV생산"] += lv_for_np3
-                    remaining_lv_capacity = max(0.0, remaining_lv_capacity - lv_for_np3)
-                    remaining_lv_inventory_room = max(
-                        0.0, INVENTORY_CAP - stocks["S3"]["LV"]
+
+            lv_need_for_selection = min(
+                lv_needed_for_stock,
+                s3_lv_capacity,
+                max(0.0, INVENTORY_CAP - current_s3_lv),
+            )
+            llv_need_for_selection = min(
+                llv_deficit,
+                max(0.0, s3_llv_capacity),
+                max(0.0, INVENTORY_CAP - current_s3_llv),
+            )
+
+            chosen_raw_grade = choose_raw_grade(
+                current_s3_raw_grade,
+                lv_need_for_selection,
+                llv_need_for_selection,
+                potential_np3 > 0,
+            )
+
+            remaining_lv_capacity = 0.0
+            remaining_lv_inventory_room = max(0.0, INVENTORY_CAP - stocks["S3"]["LV"])
+
+            if chosen_raw_grade == "LV":
+                if lv_need_for_selection > 0:
+                    stocks["S3"]["LV"] += lv_need_for_selection
+                    raw_production_today["S3 LV생산"] += lv_need_for_selection
+
+                remaining_lv_capacity = max(
+                    0.0, s3_lv_capacity - raw_production_today["S3 LV생산"]
+                )
+                remaining_lv_inventory_room = max(
+                    0.0, INVENTORY_CAP - stocks["S3"]["LV"]
+                )
+
+                if (
+                    potential_np3 > 0
+                    and NP3_PRODUCTION_RATE_IN_CAMPAIGN > 0
+                    and remaining_lv_capacity > 0
+                    and remaining_lv_inventory_room > 0
+                ):
+                    lv_capacity_for_np3 = min(
+                        remaining_lv_capacity, remaining_lv_inventory_room
                     )
-                    stocks["S3"]["NP3"] += np3_produced
-                    raw_production_today["NP3 생산"] = np3_produced
+                    max_np3_based_on_lv = (
+                        lv_capacity_for_np3 * NP3_PRODUCTION_RATE_IN_CAMPAIGN
+                    )
+                    np3_produced = min(potential_np3, max_np3_based_on_lv)
+                    if np3_produced > 0:
+                        lv_for_np3 = np3_produced / NP3_PRODUCTION_RATE_IN_CAMPAIGN
+                        stocks["S3"]["LV"] += lv_for_np3
+                        raw_production_today["S3 LV생산"] += lv_for_np3
+                        remaining_lv_capacity = max(
+                            0.0,
+                            s3_lv_capacity - raw_production_today["S3 LV생산"],
+                        )
+                        remaining_lv_inventory_room = max(
+                            0.0, INVENTORY_CAP - stocks["S3"]["LV"]
+                        )
+                        stocks["S3"]["NP3"] += np3_produced
+                        raw_production_today["NP3 생산"] = np3_produced
+
+                if raw_production_today["S3 LV생산"] > 0 or np3_produced > 0:
+                    current_s3_raw_grade = "LV"
+                else:
+                    current_s3_raw_grade = None
+            elif chosen_raw_grade == "LLV":
+                produce_s3_llv = min(
+                    llv_deficit,
+                    max(0.0, s3_llv_capacity),
+                    max(0.0, INVENTORY_CAP - current_s3_llv),
+                )
+                if produce_s3_llv > 0:
+                    stocks["S3"]["LLV"] += produce_s3_llv
+                    raw_production_today["LLV 생산"] = produce_s3_llv
+                    current_s3_raw_grade = "LLV"
+                else:
+                    current_s3_raw_grade = None
+            else:
+                current_s3_raw_grade = None
 
             hv_capacity = s1_hv_max
             target_s1_hv = min(
@@ -737,21 +866,41 @@ class SmartScheduler:
                     raw_production_today["HV 생산(S1향)"] = produce_hv
 
             # S2 생산 (H, G 펠렛)
-            h_capacity = remaining_s1s2_capacity
-            if h_daily_limit > 0:
-                h_capacity = min(h_capacity, h_daily_limit)
-            packed_h = schedule_product("H_PELLET", h_capacity)
-            if packed_h > 0:
-                remaining_s1s2_capacity = max(0.0, remaining_s1s2_capacity - packed_h)
-                switches += 1
-
-            g_capacity = remaining_s1s2_capacity
-            if g_daily_limit > 0:
-                g_capacity = min(g_capacity, g_daily_limit)
-            packed_g = schedule_product("G_PELLET", g_capacity)
-            if packed_g > 0:
-                remaining_s1s2_capacity = max(0.0, remaining_s1s2_capacity - packed_g)
-                switches += 1
+            prev_s2_grade = current_s2_grade
+            packed_h = 0.0
+            packed_g = 0.0
+            if selected_s2_grade == "H_PELLET":
+                h_capacity = min(
+                    remaining_s1s2_capacity,
+                    h_daily_limit if h_daily_limit > 0 else remaining_s1s2_capacity,
+                )
+                packed_h = schedule_product("H_PELLET", h_capacity)
+                if packed_h > 0:
+                    remaining_s1s2_capacity = max(
+                        0.0, remaining_s1s2_capacity - packed_h
+                    )
+                    if prev_s2_grade != "H_PELLET":
+                        switches += 1
+                    current_s2_grade = "H_PELLET"
+                else:
+                    current_s2_grade = None
+            elif selected_s2_grade == "G_PELLET":
+                g_capacity = min(
+                    remaining_s1s2_capacity,
+                    g_daily_limit if g_daily_limit > 0 else remaining_s1s2_capacity,
+                )
+                packed_g = schedule_product("G_PELLET", g_capacity)
+                if packed_g > 0:
+                    remaining_s1s2_capacity = max(
+                        0.0, remaining_s1s2_capacity - packed_g
+                    )
+                    if prev_s2_grade != "G_PELLET":
+                        switches += 1
+                    current_s2_grade = "G_PELLET"
+                else:
+                    current_s2_grade = None
+            else:
+                current_s2_grade = None
 
             # S1 HV 포장 (남은 capa로)
             hv_available = stocks["S1"]["HV"]
@@ -780,20 +929,40 @@ class SmartScheduler:
             if packed_c > 0:
                 switches += 1
 
+            prev_s3_granule_grade = current_s3_granule_grade
             remaining_granule_capacity = granule_capacity
-            lv_capacity = min(remaining_granule_capacity, product_status["LV_PACK"]["left"])
-            packed_lv = schedule_product("LV_PACK", lv_capacity)
-            if packed_lv > 0:
-                remaining_granule_capacity = max(0.0, remaining_granule_capacity - packed_lv)
-                switches += 1
-
-            llv_capacity = min(remaining_granule_capacity, product_status["LLV_PACK"]["left"])
-            packed_llv = schedule_product("LLV_PACK", llv_capacity)
-            if packed_llv > 0:
-                remaining_granule_capacity = max(
-                    0.0, remaining_granule_capacity - packed_llv
+            packed_lv = 0.0
+            packed_llv = 0.0
+            if selected_s3_granule_grade == "LV_PACK":
+                lv_capacity = min(
+                    remaining_granule_capacity, product_status["LV_PACK"]["left"]
                 )
-                switches += 1
+                packed_lv = schedule_product("LV_PACK", lv_capacity)
+                if packed_lv > 0:
+                    remaining_granule_capacity = max(
+                        0.0, remaining_granule_capacity - packed_lv
+                    )
+                    if prev_s3_granule_grade != "LV_PACK":
+                        switches += 1
+                    current_s3_granule_grade = "LV_PACK"
+                else:
+                    current_s3_granule_grade = None
+            elif selected_s3_granule_grade == "LLV_PACK":
+                llv_capacity = min(
+                    remaining_granule_capacity, product_status["LLV_PACK"]["left"]
+                )
+                packed_llv = schedule_product("LLV_PACK", llv_capacity)
+                if packed_llv > 0:
+                    remaining_granule_capacity = max(
+                        0.0, remaining_granule_capacity - packed_llv
+                    )
+                    if prev_s3_granule_grade != "LLV_PACK":
+                        switches += 1
+                    current_s3_granule_grade = "LLV_PACK"
+                else:
+                    current_s3_granule_grade = None
+            else:
+                current_s3_granule_grade = None
 
             s1_pack_val = product_status["HV_PACK"]["packed_today"]
             s2_pack_val = packed_h + packed_g
