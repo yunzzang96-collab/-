@@ -880,6 +880,14 @@ class SmartScheduler:
                 ),
             )
 
+            remaining_targets = any(
+                status["left"] > 0.001
+                for pid, status in product_status.items()
+                if products_db.get(pid, {}).get("target_key")
+            )
+            if not remaining_targets:
+                break
+
         summary_text = "생산 요약 및 목표 달성 현황\n" + "─" * 30 + "\n"
         products_summary_data_list = []
         for p_stat in product_status.values():
