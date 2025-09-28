@@ -653,21 +653,24 @@ class SmartScheduler:
                     stocks["S2"]["LV"] += produce_s2_lv
                     raw_production_today["S2 LV투입"] = produce_s2_lv
 
-            s3_lv_capacity = self._get_entry_value("l3_cap", PACK_S3)
-            target_s3_lv = min(
+            s3_lv_capacity = max(0.0, self._get_entry_value("l3_cap", PACK_S3))
+            target_s3_lv_base = min(
                 INVENTORY_CAP,
                 required_s3_lv + planned_lv * RESERVATION_BUFFER_DAYS,
             )
             current_s3_lv = stocks["S3"]["LV"]
-            if current_s3_lv < target_s3_lv:
-                produce_s3_lv = min(
-                    target_s3_lv - current_s3_lv,
-                    max(0.0, s3_lv_capacity),
-                    INVENTORY_CAP - current_s3_lv,
-                )
-                if produce_s3_lv > 0:
-                    stocks["S3"]["LV"] += produce_s3_lv
-                    raw_production_today["S3 LV생산"] = produce_s3_lv
+            lv_needed_for_stock = max(0.0, target_s3_lv_base - current_s3_lv)
+            lv_for_stock = min(
+                lv_needed_for_stock,
+                s3_lv_capacity,
+                max(0.0, INVENTORY_CAP - current_s3_lv),
+            )
+            if lv_for_stock > 0:
+                stocks["S3"]["LV"] += lv_for_stock
+                raw_production_today["S3 LV생산"] += lv_for_stock
+
+            remaining_lv_capacity = max(0.0, s3_lv_capacity - raw_production_today["S3 LV생산"])
+            remaining_lv_inventory_room = max(0.0, INVENTORY_CAP - stocks["S3"]["LV"])
 
             s3_llv_capacity = self._get_entry_value("l2_cap", PACK_S3)
             llv_buffer = LLV_SAFETY_STOCK_FOR_C if product_status["C_PELLET"]["left"] > 0 else 0.0
@@ -686,22 +689,36 @@ class SmartScheduler:
                     stocks["S3"]["LLV"] += produce_s3_llv
                     raw_production_today["LLV 생산"] = produce_s3_llv
 
-            np3_capacity = NP3_TARGET_BATCH_PRODUCTION_SIZE
+            np3_capacity = max(0.0, NP3_TARGET_BATCH_PRODUCTION_SIZE)
             np3_target_level = required_np3 + planned_f * RESERVATION_BUFFER_DAYS
             if product_status["F_PELLET"]["left"] > 0:
                 np3_target_level = max(np3_target_level, NP3_MIN_STOCK_BEFORE_CAMPAIGN)
                 np3_target_level = max(np3_target_level, NP3_TARGET_BATCH_PRODUCTION_SIZE)
             np3_target_level = min(NP3_MAX_INV, np3_target_level)
             current_np3 = stocks["S3"]["NP3"]
-            if current_np3 < np3_target_level:
-                produce_np3 = min(
-                    np3_target_level - current_np3,
-                    max(0.0, np3_capacity),
-                    NP3_MAX_INV - current_np3,
-                )
-                if produce_np3 > 0:
-                    stocks["S3"]["NP3"] += produce_np3
-                    raw_production_today["NP3 생산"] = produce_np3
+            np3_deficit = max(0.0, np3_target_level - current_np3)
+            np3_capacity = min(np3_capacity, max(0.0, NP3_MAX_INV - current_np3))
+            potential_np3 = min(np3_deficit, np3_capacity)
+            np3_produced = 0.0
+            if (
+                potential_np3 > 0
+                and NP3_PRODUCTION_RATE_IN_CAMPAIGN > 0
+                and remaining_lv_capacity > 0
+                and remaining_lv_inventory_room > 0
+            ):
+                lv_capacity_for_np3 = min(remaining_lv_capacity, remaining_lv_inventory_room)
+                max_np3_based_on_lv = lv_capacity_for_np3 * NP3_PRODUCTION_RATE_IN_CAMPAIGN
+                np3_produced = min(potential_np3, max_np3_based_on_lv)
+                if np3_produced > 0:
+                    lv_for_np3 = np3_produced / NP3_PRODUCTION_RATE_IN_CAMPAIGN
+                    stocks["S3"]["LV"] += lv_for_np3
+                    raw_production_today["S3 LV생산"] += lv_for_np3
+                    remaining_lv_capacity = max(0.0, remaining_lv_capacity - lv_for_np3)
+                    remaining_lv_inventory_room = max(
+                        0.0, INVENTORY_CAP - stocks["S3"]["LV"]
+                    )
+                    stocks["S3"]["NP3"] += np3_produced
+                    raw_production_today["NP3 생산"] = np3_produced
 
             hv_capacity = s1_hv_max
             target_s1_hv = min(
