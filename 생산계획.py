@@ -584,8 +584,6 @@ class SmartScheduler:
             for status in product_status.values():
                 status["packed_today"] = 0.0
 
-            previous_stocks = {silo: materials.copy() for silo, materials in stocks.items()}
-
             remaining_s1s2_capacity = self._get_entry_value(
                 "s1s2_pack_capa", PACK_S1_S2_COMBINED
             )
@@ -596,6 +594,130 @@ class SmartScheduler:
             granule_capacity = self._get_entry_value("granule_line_capa", PACK_S3)
             f_line_capacity = self._get_entry_value("f_line_capa", PACK_S3)
             c_line_capacity = self._get_entry_value("c_line_capa", PACK_S3)
+
+            planned_remaining_s1s2 = remaining_s1s2_capacity
+            planned_h_capacity = planned_remaining_s1s2
+            if h_daily_limit > 0:
+                planned_h_capacity = min(planned_h_capacity, h_daily_limit)
+            planned_h = min(product_status["H_PELLET"]["left"], planned_h_capacity)
+            planned_remaining_s1s2 = max(0.0, planned_remaining_s1s2 - planned_h)
+
+            planned_g_capacity = planned_remaining_s1s2
+            if g_daily_limit > 0:
+                planned_g_capacity = min(planned_g_capacity, g_daily_limit)
+            planned_g = min(product_status["G_PELLET"]["left"], planned_g_capacity)
+            planned_remaining_s1s2 = max(0.0, planned_remaining_s1s2 - planned_g)
+
+            planned_hv = max(0.0, min(planned_remaining_s1s2, s1_hv_max))
+
+            planned_f_capacity = f_line_capacity
+            if f_daily_limit > 0:
+                planned_f_capacity = min(planned_f_capacity, f_daily_limit)
+            planned_f = min(product_status["F_PELLET"]["left"], planned_f_capacity)
+
+            planned_c = min(product_status["C_PELLET"]["left"], c_line_capacity)
+
+            planned_granule_remaining = granule_capacity
+            planned_lv = min(product_status["LV_PACK"]["left"], planned_granule_remaining)
+            planned_granule_remaining = max(0.0, planned_granule_remaining - planned_lv)
+            planned_llv = min(product_status["LLV_PACK"]["left"], planned_granule_remaining)
+
+            required_s1_hv = 0.5 * planned_h + planned_g + planned_hv
+            required_s2_lv = 0.5 * planned_h
+            required_s3_lv = planned_lv
+            required_s3_llv = planned_c + planned_llv
+            required_np3 = planned_f
+
+            raw_production_today = {
+                "S3 LV생산": 0.0,
+                "LLV 생산": 0.0,
+                "NP3 생산": 0.0,
+                "HV 생산(S1향)": 0.0,
+                "S2 LV투입": 0.0,
+            }
+
+            s2_lv_capacity = self._get_entry_value("s2_daily", 0.0)
+            if self.emerg_var.get():
+                s2_lv_capacity += self._get_entry_value("s2_emerg", 0.0)
+            target_s2_lv = max(required_s2_lv, S2_LV_MIN_STOCK_TRIGGER)
+            if target_s2_lv > SILO2_CAP:
+                target_s2_lv = SILO2_CAP
+            current_s2_lv = stocks["S2"]["LV"]
+            if current_s2_lv < target_s2_lv:
+                produce_s2_lv = min(
+                    target_s2_lv - current_s2_lv,
+                    max(0.0, s2_lv_capacity),
+                    SILO2_CAP - current_s2_lv,
+                )
+                if produce_s2_lv > 0:
+                    stocks["S2"]["LV"] += produce_s2_lv
+                    raw_production_today["S2 LV투입"] = produce_s2_lv
+
+            s3_lv_capacity = self._get_entry_value("l3_cap", PACK_S3)
+            target_s3_lv = min(
+                INVENTORY_CAP,
+                required_s3_lv + planned_lv * RESERVATION_BUFFER_DAYS,
+            )
+            current_s3_lv = stocks["S3"]["LV"]
+            if current_s3_lv < target_s3_lv:
+                produce_s3_lv = min(
+                    target_s3_lv - current_s3_lv,
+                    max(0.0, s3_lv_capacity),
+                    INVENTORY_CAP - current_s3_lv,
+                )
+                if produce_s3_lv > 0:
+                    stocks["S3"]["LV"] += produce_s3_lv
+                    raw_production_today["S3 LV생산"] = produce_s3_lv
+
+            s3_llv_capacity = self._get_entry_value("l2_cap", PACK_S3)
+            llv_buffer = LLV_SAFETY_STOCK_FOR_C if product_status["C_PELLET"]["left"] > 0 else 0.0
+            target_s3_llv = min(
+                INVENTORY_CAP,
+                required_s3_llv + planned_llv * RESERVATION_BUFFER_DAYS + llv_buffer,
+            )
+            current_s3_llv = stocks["S3"]["LLV"]
+            if current_s3_llv < target_s3_llv:
+                produce_s3_llv = min(
+                    target_s3_llv - current_s3_llv,
+                    max(0.0, s3_llv_capacity),
+                    INVENTORY_CAP - current_s3_llv,
+                )
+                if produce_s3_llv > 0:
+                    stocks["S3"]["LLV"] += produce_s3_llv
+                    raw_production_today["LLV 생산"] = produce_s3_llv
+
+            np3_capacity = NP3_TARGET_BATCH_PRODUCTION_SIZE
+            np3_target_level = required_np3 + planned_f * RESERVATION_BUFFER_DAYS
+            if product_status["F_PELLET"]["left"] > 0:
+                np3_target_level = max(np3_target_level, NP3_MIN_STOCK_BEFORE_CAMPAIGN)
+                np3_target_level = max(np3_target_level, NP3_TARGET_BATCH_PRODUCTION_SIZE)
+            np3_target_level = min(NP3_MAX_INV, np3_target_level)
+            current_np3 = stocks["S3"]["NP3"]
+            if current_np3 < np3_target_level:
+                produce_np3 = min(
+                    np3_target_level - current_np3,
+                    max(0.0, np3_capacity),
+                    NP3_MAX_INV - current_np3,
+                )
+                if produce_np3 > 0:
+                    stocks["S3"]["NP3"] += produce_np3
+                    raw_production_today["NP3 생산"] = produce_np3
+
+            hv_capacity = s1_hv_max
+            target_s1_hv = min(
+                INVENTORY_CAP,
+                required_s1_hv + planned_hv * RESERVATION_BUFFER_DAYS,
+            )
+            current_s1_hv = stocks["S1"]["HV"]
+            if current_s1_hv < target_s1_hv:
+                produce_hv = min(
+                    target_s1_hv - current_s1_hv,
+                    max(0.0, hv_capacity),
+                    INVENTORY_CAP - current_s1_hv,
+                )
+                if produce_hv > 0:
+                    stocks["S1"]["HV"] += produce_hv
+                    raw_production_today["HV 생산(S1향)"] = produce_hv
 
             # S2 생산 (H, G 펠렛)
             h_capacity = remaining_s1s2_capacity
@@ -669,9 +791,7 @@ class SmartScheduler:
                 + stocks["S3"].get("NP3", 0.0)
             )
 
-            s2_lv_input = max(
-                0.0, previous_stocks["S2"]["LV"] - stocks["S2"]["LV"]
-            )
+            s2_lv_input = raw_production_today["S2 LV투입"]
 
             self.tree_s1_plan.insert(
                 "",
@@ -720,10 +840,10 @@ class SmartScheduler:
                 "end",
                 values=(
                     date_str,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
+                    round(raw_production_today["S3 LV생산"], 1),
+                    round(raw_production_today["LLV 생산"], 1),
+                    round(raw_production_today["NP3 생산"], 1),
+                    round(raw_production_today["HV 생산(S1향)"], 1),
                     round(s2_lv_input, 1),
                 ),
             )
